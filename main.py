@@ -15,7 +15,7 @@ os.makedirs('iteration', exist_ok=True)
 
 device = torch.device('cuda')
 L_embed = 6
-N_samples = 32
+N_samples = 64
 N_iters = 1000
 psnrs = []
 iternums = []
@@ -39,34 +39,75 @@ def get_rays(H, W, focal, c2w):
     return rays_o, rays_d
 
 
-def render_rays(network_fn, rays_o, rays_d, near, far, N_samples, rand=False):
+@torch.no_grad()
+def eval_one_view(network_fn, rays_o, rays_d, near, far, N_samples, chunk=8192):
     # Compute 3D query points
-    z_vals = torch.linspace(near, far, N_samples, device=device).view(1, 1, N_samples)
-    if rand:
-        z_vals = z_vals + torch.rand(list(rays_o.shape[:-1]) + [N_samples], device=device) * (far-near) / N_samples
+    z_vals = torch.linspace(near, far, N_samples, device=device).view(1, N_samples)
+
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]
 
-    pts = posenc(pts)
-    raw = network_fn(pts)
+    rgbs = []
 
-    # Compute opacities and colors)
-    sigma_a = F.softplus(raw[..., 3])
-    warnings.warn('relu might cause zero gradient for every parameter, so here I change it to softplus\n'
-                  'use `sigma_a = F.relu(raw[..., 3])` if it can lead to better performance (but it can\'t)')
-    rgb = torch.sigmoid(raw[..., :3]) 
+    H, W, P, C = pts.shape
+    pts = pts.view(H*W, P, C)
 
-    # Do volume rendering
-    dists = torch.cat([z_vals[..., 1:] - z_vals[..., :-1], torch.full(z_vals[..., :1].shape, 1e10, device=device)], dim=-1)
-    alpha = 1. - torch.exp(-sigma_a * dists)  
+    for i in range(0, pts.shape[0], chunk):
+        points = pts[i: i+chunk]
+        points = posenc(points)
 
-    weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
+        raw = network_fn(points)
 
-    rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
-    depth_map = torch.sum(weights * z_vals, dim=-1) 
-    acc_map = torch.sum(weights, dim=-1)
+        # Compute opacities and colors)
+        sigma_a = F.softplus(raw[..., 3])
+        rgb = torch.sigmoid(raw[..., :3])
 
-    return rgb_map, depth_map, acc_map
+        # Do volume rendering
+        dists = torch.cat([z_vals[..., 1:] - z_vals[..., :-1], torch.full(z_vals[..., :1].shape, 1e10, device=device)], dim=-1)
+        alpha = 1. - torch.exp(-sigma_a * dists)
+        weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
+        rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
 
+        rgbs.append(rgb_map)
+
+    image = torch.cat(rgbs, dim=0).view(H, W, 3)
+    return image
+
+
+def train_one_view(network_fn, rays_o, rays_d, target, near, far, N_samples, chunk=8192):
+    # Compute 3D query points
+    z_vals = torch.linspace(near, far, N_samples, device=device).view(1, 1, N_samples)
+
+    # add noise
+    z_vals = z_vals + torch.rand(list(rays_o.shape[:-1]) + [N_samples], device=device) * (far-near) / N_samples
+
+    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]
+
+    H, W, P, C = pts.shape
+    pts = pts.view(H*W, P, C)
+    target = target.view(H*W, 3)
+    z_vals = z_vals.view(H*W, P)
+
+    for i in range(0, pts.shape[0], chunk):
+        points = pts[i: i+chunk]
+        points = posenc(points)
+
+        raw = network_fn(points)
+
+        # Compute opacities and colors)
+        sigma_a = F.softplus(raw[..., 3])
+        rgb = torch.sigmoid(raw[..., :3])
+
+        # Do volume rendering
+        dists = torch.cat([z_vals[i: i+chunk, ..., 1:] - z_vals[i: i+chunk, ..., :-1], torch.full(z_vals[i: i+chunk, ..., :1].shape, 1e10, device=device)], dim=-1)
+        alpha = 1. - torch.exp(-sigma_a * dists)  
+
+        weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
+
+        rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
+        loss = torch.sum((rgb_map - target[i:i+chunk]) ** 2)
+        loss.backward()
+
+    return
 
 trans_t = lambda t : torch.FloatTensor([[1,0,0,0],
                                         [0,1,0,0],
@@ -92,7 +133,6 @@ def pose_spherical(theta, phi, radius):
     return c2w
 
 
-
 if __name__ == '__main__':
 
     data = np.load('tiny_nerf_data.npz')
@@ -116,6 +156,7 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), 5e-4)
 
     t = time.time()
+    accumulate_iter = 4
     for i in range(N_iters+1):
         
         img_i = np.random.randint(images.shape[0])
@@ -123,11 +164,11 @@ if __name__ == '__main__':
         pose = torch.FloatTensor(poses[img_i]).to(device)
         rays_o, rays_d = get_rays(H, W, focal, pose)
 
-        rgb, depth, acc = render_rays(model, rays_o, rays_d, near=2., far=6., N_samples=N_samples, rand=True)
-        loss = torch.mean((rgb - target)**2)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if i % accumulate_iter == 0:
+            optimizer.zero_grad()
+        train_one_view(model, rays_o, rays_d, target, near=2., far=6., N_samples=N_samples)
+        if (i + 1) % accumulate_iter == 0:
+            optimizer.step()
 
         if i % i_plot==0:
             print(i, (time.time() - t) / i_plot, 'secs per iter')
@@ -135,7 +176,7 @@ if __name__ == '__main__':
             
             # Render the holdout view for logging
             rays_o, rays_d = get_rays(H, W, focal, testpose)
-            rgb, depth, acc = render_rays(model, rays_o, rays_d, near=2., far=6., N_samples=N_samples)
+            rgb = eval_one_view(model, rays_o, rays_d, near=2., far=6., N_samples=N_samples)
             loss = torch.mean((rgb - testimg)**2)
             psnr = -10. * torch.log(loss) / np.log(10.)
 
@@ -159,7 +200,7 @@ if __name__ == '__main__':
     for th in tqdm(np.linspace(0., 360., 120, endpoint=False)):
         c2w = pose_spherical(th, -30., 4.)
         rays_o, rays_d = get_rays(H, W, focal, c2w[:3,:4])
-        rgb, _, _ = render_rays(model, rays_o, rays_d, near=2., far=6., N_samples=N_samples)
+        rgb = eval_one_view(model, rays_o, rays_d, near=2., far=6., N_samples=N_samples)
         rgb = torch.clip(255*rgb,0,255).cpu().detach().numpy().astype(np.uint8)
         frames.append(rgb)
 
