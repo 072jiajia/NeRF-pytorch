@@ -1,5 +1,6 @@
 import os
 import time
+import warnings
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -14,7 +15,7 @@ os.makedirs('iteration', exist_ok=True)
 
 device = torch.device('cuda')
 L_embed = 6
-N_samples = 30
+N_samples = 32
 N_iters = 1000
 psnrs = []
 iternums = []
@@ -48,9 +49,10 @@ def render_rays(network_fn, rays_o, rays_d, near, far, N_samples, rand=False):
     pts = posenc(pts)
     raw = network_fn(pts)
 
-    # Compute opacities and colors
-    # sigma_a = F.relu(raw[..., 3])
+    # Compute opacities and colors)
     sigma_a = F.softplus(raw[..., 3])
+    warnings.warn('relu might cause zero gradient for every parameter, so here I change it to softplus\n'
+                  'use `sigma_a = F.relu(raw[..., 3])` if it can lead to better performance (but it can\'t)')
     rgb = torch.sigmoid(raw[..., :3]) 
 
     # Do volume rendering
@@ -58,8 +60,6 @@ def render_rays(network_fn, rays_o, rays_d, near, far, N_samples, rand=False):
     alpha = 1. - torch.exp(-sigma_a * dists)  
 
     weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
-    # front_alpha = torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha[..., :-1] + 1e-10], dim=-1)
-    # weights = alpha * torch.cumprod(front_alpha, dim=-1)
 
     rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
     depth_map = torch.sum(weights * z_vals, dim=-1) 
