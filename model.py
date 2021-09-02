@@ -27,7 +27,6 @@ class NERF(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x)
             x = self.act(x)
-            if i % 4==0 and i > 0:
+            if i % 4 == 0 and i > 0:
                 x = torch.cat([x, input], dim=-1)
         return self.last_layer(x)
-
