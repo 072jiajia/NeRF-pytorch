@@ -21,7 +21,7 @@ device = torch.device('cuda')
 position_encoding.L_embed = 6
 eval_freq = 25
 N_iterations = 1000
-accumulate_iter = 4
+accumulate_iter = 1
 
 view_param = {
     "N_samples": 64,
@@ -96,8 +96,7 @@ def train_one_view(network_fn, rays_o, rays_d, target, near, far, N_samples, chu
         alpha = 1. - torch.exp(-sigma_a * dists[i: i+chunk])
 
         # alpha = [a, b, c, d]  >>>  output = [a, b(1-a), c(1-a)(1-b), d(1-a)(1-b)(1-c)]
-        weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(
-            alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
+        weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
 
         rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
         loss = torch.sum((rgb_map - target[i:i+chunk]) ** 2)
