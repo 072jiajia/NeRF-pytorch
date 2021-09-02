@@ -131,8 +131,8 @@ if __name__ == '__main__':
     print('Done')
 
     frames = []
-    for th in tqdm(np.linspace(0., 360., 120, endpoint=False)):
-        c2w = pose_spherical(th, -30., 4.)
+    for th in tqdm.tqdm(np.linspace(0., 360., 120, endpoint=False)):
+        c2w = pose_spherical(th, -30., 4., device)
         rays_o, rays_d = get_rays(H, W, focal, c2w[:3, :4], device)
         rgb, _, _ = render_rays(model, rays_o, rays_d, **view_param)
         rgb = torch.clip(255*rgb, 0, 255).cpu().detach().numpy().astype(np.uint8)
