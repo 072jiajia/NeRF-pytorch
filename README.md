@@ -11,6 +11,10 @@ What's new?
  - split pixels to chunks to make the smaller GPUs can achieve the performance of better GPUs
 
 ## Installation
+Download the toy sample
+```
+wget https://people.eecs.berkeley.edu/~bmild/nerf/tiny_nerf_data.npz
+```
 All requirements should be detailed in requirements.txt. Using virtual environment is recommended.
 ```
 conda create --name nerf python=3.8
