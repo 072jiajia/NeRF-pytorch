@@ -1,59 +1,51 @@
 import os
 import time
+import imageio
 import warnings
 import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 
-from tqdm import tqdm
+import tqdm
+from IPython.display import HTML
+from base64 import b64encode
 
 import model
+from utils import position_encoding, get_rays, pose_spherical
 
 os.environ['CUDA_VISIBLE_DEVICES'] = "9"
-os.makedirs('iteration', exist_ok=True)
+os.makedirs('checkpoint', exist_ok=True)
 
 device = torch.device('cuda')
-L_embed = 6
-N_samples = 64
-N_iters = 1000
-psnrs = []
-iternums = []
-i_plot = 25
+position_encoding.L_embed = 6
+eval_freq = 25
+N_iterations = 1000
+accumulate_iter = 4
 
-def posenc(x):
-    rets = [x]
-    for i in range(L_embed):
-        for fn in [torch.sin, torch.cos]:
-            rets.append(fn(2.**i * x))
-    return torch.cat(rets, dim=-1)
+view_param = {
+    "N_samples": 64,
+    "near": 2,
+    "far": 6,
+}
 
-
-def get_rays(H, W, focal, c2w):
-    i, j = torch.meshgrid(torch.arange(0, W, device=device), torch.arange(0, H, device=device))
-    i, j = i.T, j.T
-
-    dirs = torch.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -torch.ones_like(i)], dim=-1)
-    rays_d = torch.sum(dirs[..., None, :] * c2w[:3,:3], dim=-1)
-    rays_o = torch.broadcast_to(c2w[:3,-1], rays_d.shape)
-    return rays_o, rays_d
 
 
 @torch.no_grad()
 def eval_one_view(network_fn, rays_o, rays_d, near, far, N_samples, chunk=8192):
+    H, W, C = rays_o.shape
+
     # Compute 3D query points
     z_vals = torch.linspace(near, far, N_samples, device=device).view(1, N_samples)
+    dists = torch.cat([z_vals[..., 1:] - z_vals[..., :-1],
+                      torch.full(z_vals[..., :1].shape, 1e10, device=device)], dim=-1)
 
-    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]
+    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
+    pts = pts.view(H*W, N_samples, C)
 
     rgbs = []
-
-    H, W, P, C = pts.shape
-    pts = pts.view(H*W, P, C)
-
     for i in range(0, pts.shape[0], chunk):
-        points = pts[i: i+chunk]
-        points = posenc(points)
+        points = position_encoding(pts[i: i+chunk])
 
         raw = network_fn(points)
 
@@ -62,8 +54,9 @@ def eval_one_view(network_fn, rays_o, rays_d, near, far, N_samples, chunk=8192):
         rgb = torch.sigmoid(raw[..., :3])
 
         # Do volume rendering
-        dists = torch.cat([z_vals[..., 1:] - z_vals[..., :-1], torch.full(z_vals[..., :1].shape, 1e10, device=device)], dim=-1)
         alpha = 1. - torch.exp(-sigma_a * dists)
+
+        # alpha = [a, b, c, d]  >>>  output = [a, b(1-a), c(1-a)(1-b), d(1-a)(1-b)(1-c)]
         weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
         rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
 
@@ -74,22 +67,24 @@ def eval_one_view(network_fn, rays_o, rays_d, near, far, N_samples, chunk=8192):
 
 
 def train_one_view(network_fn, rays_o, rays_d, target, near, far, N_samples, chunk=8192):
+    H, W, C = rays_o.shape
+
     # Compute 3D query points
     z_vals = torch.linspace(near, far, N_samples, device=device).view(1, 1, N_samples)
-
     # add noise
-    z_vals = z_vals + torch.rand(list(rays_o.shape[:-1]) + [N_samples], device=device) * (far-near) / N_samples
+    z_vals = z_vals + torch.rand(H, W, N_samples, device=device) * (far-near) / N_samples
 
-    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None]
+    pts = rays_o[:, :, None, :] + rays_d[:, :, None, :] * z_vals[..., :, None]
 
-    H, W, P, C = pts.shape
-    pts = pts.view(H*W, P, C)
+    pts = pts.view(H*W, N_samples, C)
     target = target.view(H*W, 3)
-    z_vals = z_vals.view(H*W, P)
+    z_vals = z_vals.view(H * W, N_samples)
+
+    dists = torch.cat([z_vals[..., 1:] - z_vals[..., :-1],
+                      torch.full(z_vals[..., :1].shape, 1e10, device=device)], dim=-1)
 
     for i in range(0, pts.shape[0], chunk):
-        points = pts[i: i+chunk]
-        points = posenc(points)
+        points = position_encoding(pts[i: i+chunk])
 
         raw = network_fn(points)
 
@@ -98,10 +93,11 @@ def train_one_view(network_fn, rays_o, rays_d, target, near, far, N_samples, chu
         rgb = torch.sigmoid(raw[..., :3])
 
         # Do volume rendering
-        dists = torch.cat([z_vals[i: i+chunk, ..., 1:] - z_vals[i: i+chunk, ..., :-1], torch.full(z_vals[i: i+chunk, ..., :1].shape, 1e10, device=device)], dim=-1)
-        alpha = 1. - torch.exp(-sigma_a * dists)  
+        alpha = 1. - torch.exp(-sigma_a * dists[i: i+chunk])
 
-        weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
+        # alpha = [a, b, c, d]  >>>  output = [a, b(1-a), c(1-a)(1-b), d(1-a)(1-b)(1-c)]
+        weights = alpha * (torch.cumprod(torch.cat([torch.ones_like(
+            alpha[..., :1]), 1. - alpha + 1e-10], dim=-1), dim=-1)[..., :-1])
 
         rgb_map = torch.sum(weights[..., None] * rgb, dim=-2)
         loss = torch.sum((rgb_map - target[i:i+chunk]) ** 2)
@@ -109,32 +105,10 @@ def train_one_view(network_fn, rays_o, rays_d, target, near, far, N_samples, chu
 
     return
 
-trans_t = lambda t : torch.FloatTensor([[1,0,0,0],
-                                        [0,1,0,0],
-                                        [0,0,1,t],
-                                        [0,0,0,1]]).to(device)
-
-rot_phi = lambda phi : torch.FloatTensor([[1,0,0,0],
-                                          [0,np.cos(phi),-np.sin(phi),0],
-                                          [0,np.sin(phi), np.cos(phi),0],
-                                          [0,0,0,1]]).to(device)
-
-rot_theta = lambda th : torch.FloatTensor([[np.cos(th),0,-np.sin(th),0],
-                                           [0,1,0,0],
-                                           [np.sin(th),0, np.cos(th),0],
-                                           [0,0,0,1]]).to(device)
-
-
-def pose_spherical(theta, phi, radius):
-    c2w = trans_t(radius)
-    c2w = rot_phi(phi/180.*np.pi) @ c2w
-    c2w = rot_theta(theta/180.*np.pi) @ c2w
-    c2w = torch.FloatTensor([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]]).to(device) @ c2w
-    return c2w
-
 
 if __name__ == '__main__':
 
+    # Load data
     data = np.load('tiny_nerf_data.npz')
     images = data['images']
     poses = data['poses']
@@ -142,8 +116,9 @@ if __name__ == '__main__':
     H, W = images.shape[1:3]
     print(images.shape, poses.shape, focal)
 
+    # Split train / test
     testimg, testpose = images[101], poses[101]
-    images = images[:100,...,:3]
+    images = images[:100, :, :, :3]
     poses = poses[:100]
 
     plt.imshow(testimg)
@@ -152,66 +127,66 @@ if __name__ == '__main__':
     testimg = torch.FloatTensor(testimg).to(device)
     testpose = torch.FloatTensor(testpose).to(device)
 
-    model = model.NERF(D=8, W=256, L_embed=L_embed).to(device)
+    # Define Model
+    model = model.NERF(D=8, W=256, L_embed=position_encoding.L_embed)
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), 5e-4)
 
+    # initialize meters
+    psnrs = []
+    iternums = []
     t = time.time()
-    accumulate_iter = 4
-    for i in range(N_iters+1):
-        
+    tqdm_iter = tqdm.tqdm(range(N_iterations+1))
+    for i in tqdm_iter:
+
         img_i = np.random.randint(images.shape[0])
         target = torch.FloatTensor(images[img_i]).to(device)
         pose = torch.FloatTensor(poses[img_i]).to(device)
-        rays_o, rays_d = get_rays(H, W, focal, pose)
+        rays_o, rays_d = get_rays(H, W, focal, pose, device)
 
         if i % accumulate_iter == 0:
             optimizer.zero_grad()
-        train_one_view(model, rays_o, rays_d, target, near=2., far=6., N_samples=N_samples)
+
+        train_one_view(model, rays_o, rays_d, target, **view_param)
+
         if (i + 1) % accumulate_iter == 0:
             optimizer.step()
 
-        if i % i_plot==0:
-            print(i, (time.time() - t) / i_plot, 'secs per iter')
-            t = time.time()
-            
+        if i % eval_freq == 0:
             # Render the holdout view for logging
-            rays_o, rays_d = get_rays(H, W, focal, testpose)
-            rgb = eval_one_view(model, rays_o, rays_d, near=2., far=6., N_samples=N_samples)
+            rays_o, rays_d = get_rays(H, W, focal, testpose, device)
+            rgb = eval_one_view(model, rays_o, rays_d, **view_param)
             loss = torch.mean((rgb - testimg)**2)
             psnr = -10. * torch.log(loss) / np.log(10.)
 
-            psnrs.append(psnr.cpu().detach().numpy())
+            psnrs.append(psnr.cpu().numpy())
             iternums.append(i)
-            
-            plt.figure(figsize=(10,4))
+
+            plt.figure(figsize=(10, 4))
             plt.subplot(121)
-            plt.imshow(rgb.cpu().detach().numpy())
+            plt.imshow(rgb.cpu().numpy())
             plt.title(f'Iteration: {i}')
             plt.subplot(122)
             plt.plot(iternums, psnrs)
             plt.title('PSNR')
-            plt.savefig(f'iteration/{i}.png')
+            plt.savefig(f'checkpoint/iteration_{i}.png')
             plt.close()
+            tqdm_iter.set_description(f'checkpoint/iteration_{i}.png generated')
 
     print('Done')
 
-
     frames = []
-    for th in tqdm(np.linspace(0., 360., 120, endpoint=False)):
-        c2w = pose_spherical(th, -30., 4.)
-        rays_o, rays_d = get_rays(H, W, focal, c2w[:3,:4])
-        rgb = eval_one_view(model, rays_o, rays_d, near=2., far=6., N_samples=N_samples)
-        rgb = torch.clip(255*rgb,0,255).cpu().detach().numpy().astype(np.uint8)
+    for th in tqdm.tqdm(np.linspace(0., 360., 120, endpoint=False)):
+        c2w = pose_spherical(th, -30., 4., device)
+        rays_o, rays_d = get_rays(H, W, focal, c2w[:3, :4], device)
+        rgb = eval_one_view(model, rays_o, rays_d, **view_param)
+        rgb = torch.clip(255*rgb, 0, 255).cpu().detach().numpy().astype(np.uint8)
         frames.append(rgb)
 
-    import imageio
     f = 'video.mp4'
     imageio.mimwrite(f, frames, fps=30, quality=7)
 
-
-    from IPython.display import HTML
-    from base64 import b64encode
-    mp4 = open('video.mp4','rb').read()
+    mp4 = open('video.mp4', 'rb').read()
     data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
     HTML("""
     <video width=400 controls autoplay loop>
